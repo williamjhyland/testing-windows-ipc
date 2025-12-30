@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,16 +30,11 @@ func init() {
 }
 
 type Config struct {
-	// Desktop shortcut behavior.
-	ShortcutName string `json:"shortcut_name,omitempty"` // default: "Viam Logging IPC"
-	Message      string `json:"message,omitempty"`       // default: "hello from desktop shortcut"
-
-	// HTTP endpoint the helpers post to.
-	// Example: http://127.0.0.1:17831/log
-	Endpoint string `json:"endpoint,omitempty"`
+	ShortcutName string `json:"shortcut_name,omitempty"`
+	Message      string `json:"message,omitempty"`
+	Endpoint     string `json:"endpoint,omitempty"`
 }
 
-// Validate ensures all parts of the config are valid and important fields exist.
 func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	return nil, nil, nil
 }
@@ -53,11 +49,16 @@ type testingWindowsIpcLoggingIpc struct {
 	cancelCtx  context.Context
 	cancelFunc func()
 
-	// Best-effort (only visible if running in an interactive user session).
 	trayCmd *exec.Cmd
 }
 
-func newTestingWindowsIpcLoggingIpc(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
+func newTestingWindowsIpcLoggingIpc(
+	ctx context.Context,
+	deps resource.Dependencies,
+	rawConf resource.Config,
+	logger logging.Logger,
+) (resource.Resource, error) {
+
 	conf, err := resource.NativeConfig[*Config](rawConf)
 	if err != nil {
 		return nil, err
@@ -65,7 +66,14 @@ func newTestingWindowsIpcLoggingIpc(ctx context.Context, deps resource.Dependenc
 	return NewLoggingIpc(ctx, deps, rawConf.ResourceName(), conf, logger)
 }
 
-func NewLoggingIpc(ctx context.Context, deps resource.Dependencies, name resource.Name, conf *Config, logger logging.Logger) (resource.Resource, error) {
+func NewLoggingIpc(
+	ctx context.Context,
+	deps resource.Dependencies,
+	name resource.Name,
+	conf *Config,
+	logger logging.Logger,
+) (resource.Resource, error) {
+
 	cancelCtx, cancelFunc := context.WithCancel(ctx)
 
 	s := &testingWindowsIpcLoggingIpc{
@@ -76,19 +84,21 @@ func NewLoggingIpc(ctx context.Context, deps resource.Dependencies, name resourc
 		cancelFunc: cancelFunc,
 	}
 
-	// IPC server used by helpers to post a message we log.
+	// IPC server (module only)
 	StartIPCServer(logger)
 
-	// 1) Ensure desktop shortcut exists.
-	if err := s.ensureDesktopShortcutOnConstruct(); err != nil {
-		s.logger.Errorf("failed to create desktop shortcut on construct: %v", err)
+	if runtime.GOOS == "windows" {
+		if err := s.ensureStableHelpers(); err != nil {
+			s.logger.Errorf("failed to ensure stable helpers: %v", err)
+		}
 	}
 
-	// 2) Ensure tray helper is configured + started.
-	//    - Create a "Common Startup" shortcut so it WILL appear for a logged-in user session.
-	//    - Also try to start it immediately (best-effort; if viam-server runs as LocalSystem, it won't be visible).
+	if err := s.ensureDesktopShortcutOnConstruct(); err != nil {
+		s.logger.Errorf("failed to create desktop shortcut: %v", err)
+	}
+
 	if err := s.ensureTrayOnConstruct(); err != nil {
-		s.logger.Errorf("failed to configure/start tray helper on construct: %v", err)
+		s.logger.Errorf("failed to configure tray helper: %v", err)
 	}
 
 	return s, nil
@@ -96,7 +106,22 @@ func NewLoggingIpc(ctx context.Context, deps resource.Dependencies, name resourc
 
 func (s *testingWindowsIpcLoggingIpc) Name() resource.Name { return s.name }
 
-func (s *testingWindowsIpcLoggingIpc) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+func (s *testingWindowsIpcLoggingIpc) Close(context.Context) error {
+	s.cancelFunc()
+
+	if s.trayCmd != nil && s.trayCmd.Process != nil {
+		_ = s.trayCmd.Process.Kill()
+		_, _ = s.trayCmd.Process.Wait()
+	}
+
+	return nil
+}
+
+func (s *testingWindowsIpcLoggingIpc) DoCommand(
+	ctx context.Context,
+	cmd map[string]interface{},
+) (map[string]interface{}, error) {
+
 	raw, ok := cmd["command"]
 	if !ok {
 		return nil, fmt.Errorf("missing 'command'")
@@ -107,6 +132,7 @@ func (s *testingWindowsIpcLoggingIpc) DoCommand(ctx context.Context, cmd map[str
 	}
 
 	switch command {
+
 	case "log":
 		msg, _ := cmd["message"].(string)
 		if msg == "" {
@@ -125,17 +151,29 @@ func (s *testingWindowsIpcLoggingIpc) DoCommand(ctx context.Context, cmd map[str
 			message = "hello from desktop shortcut"
 		}
 
-		shortcutPath, helperExe, args, workDir, err := s.buildDesktopShortcutParts(shortcutName, message)
-		if err != nil {
+		shortcutPath := filepath.Join(
+			publicDesktopDir(),
+			shortcutName+".lnk",
+		)
+
+		workDir := stableHelperDir()
+		helperExe := filepath.Join(workDir, "desktop-helper.exe")
+
+		args := fmt.Sprintf(
+			`-endpoint "%s" -msg "%s"`,
+			s.effectiveEndpoint(),
+			message,
+		)
+
+		if err := createWindowsShortcut(
+			shortcutPath,
+			helperExe,
+			args,
+			workDir,
+		); err != nil {
 			return nil, err
 		}
 
-		if err := createWindowsShortcut(shortcutPath, helperExe, args, workDir); err != nil {
-			s.logger.Errorf("create_shortcut failed: %v", err)
-			return nil, err
-		}
-
-		s.logger.Infof("Created desktop shortcut: %s -> %s %s", shortcutPath, helperExe, args)
 		return map[string]interface{}{
 			"ok":       true,
 			"shortcut": shortcutPath,
@@ -147,21 +185,64 @@ func (s *testingWindowsIpcLoggingIpc) DoCommand(ctx context.Context, cmd map[str
 	}
 }
 
-func (s *testingWindowsIpcLoggingIpc) Close(context.Context) error {
-	s.cancelFunc()
+//
+// --------------------
+// Stable helper install
+// --------------------
+//
 
-	// Best-effort: stop any tray process we started directly.
-	if s.trayCmd != nil && s.trayCmd.Process != nil {
-		_ = s.trayCmd.Process.Kill()
-		_, _ = s.trayCmd.Process.Wait()
+func (s *testingWindowsIpcLoggingIpc) ensureStableHelpers() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	moduleBin := filepath.Dir(exe)
+
+	stableDir := stableHelperDir()
+	if err := os.MkdirAll(stableDir, 0755); err != nil {
+		return err
 	}
 
+	for _, name := range []string{"desktop-helper.exe", "tray-helper.exe"} {
+		src := filepath.Join(moduleBin, name)
+		dst := filepath.Join(stableDir, name)
+		if err := copyReplace(src, dst); err != nil {
+			return fmt.Errorf("copy %s: %w", name, err)
+		}
+	}
+
+	s.logger.Infof("Stable helpers refreshed in %s", stableDir)
 	return nil
 }
 
-// ------------------------
+func copyReplace(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	tmp := dst + ".tmp"
+	out, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+
+	return os.Rename(tmp, dst)
+}
+
+//
+// --------------------
 // Desktop shortcut
-// ------------------------
+// --------------------
+//
 
 func (s *testingWindowsIpcLoggingIpc) ensureDesktopShortcutOnConstruct() error {
 	if runtime.GOOS != "windows" {
@@ -180,77 +261,61 @@ func (s *testingWindowsIpcLoggingIpc) ensureDesktopShortcutOnConstruct() error {
 		}
 	}
 
-	shortcutPath, helperExe, args, workDir, err := s.buildDesktopShortcutParts(shortcutName, message)
-	if err != nil {
-		return err
-	}
+	shortcutPath := filepath.Join(publicDesktopDir(), shortcutName+".lnk")
+	helperExe := filepath.Join(stableHelperDir(), "desktop-helper.exe")
+	workDir := stableHelperDir()
 
-	if err := createWindowsShortcut(shortcutPath, helperExe, args, workDir); err != nil {
-		return err
-	}
+	args := fmt.Sprintf(`-endpoint "%s" -msg "%s"`, s.effectiveEndpoint(), message)
 
-	s.logger.Infof("Created desktop shortcut on construct: %s -> %s %s", shortcutPath, helperExe, args)
-	return nil
+	return createWindowsShortcut(shortcutPath, helperExe, args, workDir)
 }
 
-func (s *testingWindowsIpcLoggingIpc) buildDesktopShortcutParts(shortcutName, message string) (shortcutPath, helperExe, args, workDir string, err error) {
-	desk := publicDesktopDir()
-	shortcutPath = filepath.Join(desk, shortcutName+".lnk")
-
-	helperExe, workDir, err = s.findSiblingExe("desktop-helper")
-	if err != nil {
-		return "", "", "", "", err
-	}
-
-	endpoint := s.effectiveEndpoint()
-	args = fmt.Sprintf(`-endpoint "%s" -msg "%s"`, endpoint, message)
-	return shortcutPath, helperExe, args, workDir, nil
-}
-
-// ------------------------
+//
+// --------------------
 // Tray helper
-// ------------------------
+// --------------------
+//
 
 func (s *testingWindowsIpcLoggingIpc) ensureTrayOnConstruct() error {
 	if runtime.GOOS != "windows" {
 		return nil
 	}
 
-	trayExe, workDir, err := s.findSiblingExe("tray-helper")
-	if err != nil {
+	workDir := stableHelperDir()
+	trayExe := filepath.Join(workDir, "tray-helper.exe")
+	endpoint := s.effectiveEndpoint()
+
+	startupShortcut := filepath.Join(
+		commonStartupDir(),
+		"Viam Logging IPC Tray.lnk",
+	)
+
+	if err := createWindowsShortcut(
+		startupShortcut,
+		trayExe,
+		fmt.Sprintf(`-endpoint "%s"`, endpoint),
+		workDir,
+	); err != nil {
 		return err
 	}
 
-	endpoint := s.effectiveEndpoint()
-
-	// A) Ensure it will show up for an actual logged-in user:
-	// Put a shortcut in the common Startup folder so it runs on user logon (interactive session).
-	startup := commonStartupDir()
-	startupShortcut := filepath.Join(startup, "Viam Logging IPC Tray.lnk")
-	startupArgs := fmt.Sprintf(`-endpoint "%s"`, endpoint)
-	if err := createWindowsShortcut(startupShortcut, trayExe, startupArgs, workDir); err != nil {
-		return fmt.Errorf("failed creating startup shortcut for tray helper: %w", err)
-	}
-	s.logger.Infof("Created startup shortcut for tray helper: %s -> %s %s", startupShortcut, trayExe, startupArgs)
-
-	// B) Best-effort: try to start it immediately as a child process.
-	// NOTE: If viam-server is running as LocalSystem (Session 0), the tray icon will NOT be visible to the user.
 	cmd := exec.CommandContext(s.cancelCtx, trayExe, "-endpoint", endpoint)
 	cmd.Dir = workDir
+
 	if err := cmd.Start(); err != nil {
-		// Don’t fail the module if this doesn’t start.
-		s.logger.Warnf("tray-helper did not start immediately (startup shortcut still created): %v", err)
+		s.logger.Warnf("tray-helper did not start immediately: %v", err)
 		return nil
 	}
 
 	s.trayCmd = cmd
-	s.logger.Infof("Started tray helper (best effort): %s (pid=%d)", trayExe, cmd.Process.Pid)
 	return nil
 }
 
-// ------------------------
+//
+// --------------------
 // Helpers
-// ------------------------
+// --------------------
+//
 
 func (s *testingWindowsIpcLoggingIpc) effectiveEndpoint() string {
 	endpoint := "http://127.0.0.1:17831/log"
@@ -260,33 +325,15 @@ func (s *testingWindowsIpcLoggingIpc) effectiveEndpoint() string {
 	return endpoint
 }
 
-// findSiblingExe finds an executable in the same directory as the module executable.
-// Your module runs with working dir = bin/, so this expects:
-//
-//	bin/desktop-helper.exe
-//	bin/tray-helper.exe
-func (s *testingWindowsIpcLoggingIpc) findSiblingExe(base string) (exePath string, workDir string, err error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return "", "", err
+func stableHelperDir() string {
+	progData := os.Getenv("ProgramData")
+	if progData == "" {
+		progData = `C:\ProgramData`
 	}
-	workDir = filepath.Dir(exe)
-
-	name := base
-	if runtime.GOOS == "windows" && !strings.HasSuffix(strings.ToLower(name), ".exe") {
-		name += ".exe"
-	}
-
-	exePath = filepath.Join(workDir, name)
-	if _, err := os.Stat(exePath); err != nil {
-		return "", "", fmt.Errorf("%s not found next to module executable: %s (err=%v)", name, exePath, err)
-	}
-
-	return exePath, workDir, nil
+	return filepath.Join(progData, "Viam", "testing-windows-ipc")
 }
 
 func publicDesktopDir() string {
-	// Prefer %PUBLIC%\Desktop if available.
 	pub := os.Getenv("PUBLIC")
 	if pub != "" {
 		return filepath.Join(pub, "Desktop")
@@ -295,11 +342,16 @@ func publicDesktopDir() string {
 }
 
 func commonStartupDir() string {
-	// Common Startup folder (runs for any user at logon):
-	// C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup
 	progData := os.Getenv("ProgramData")
 	if progData == "" {
 		progData = `C:\ProgramData`
 	}
-	return filepath.Join(progData, "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+	return filepath.Join(
+		progData,
+		"Microsoft",
+		"Windows",
+		"Start Menu",
+		"Programs",
+		"Startup",
+	)
 }

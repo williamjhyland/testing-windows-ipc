@@ -2,23 +2,21 @@
   "$schema": "https://dl.viam.dev/module.schema.json",
   "module_id": "bill:testing-windows-ipc",
   "visibility": "public",
-  "url": "",
+  "url": "https://github.com/williamjhyland/testing-windows-ipc",
   "description": "Modular generic service: logging-ipc",
   "models": [
     {
       "api": "rdk:service:generic",
       "model": "bill:testing-windows-ipc:logging-ipc",
-      "short_description": "Provide a short (100 characters or less) description of this model here",
+      "short_description": "IPC-backed logging service for Windows helpers",
       "markdown_link": "README.md#model-billtesting-windows-ipclogging-ipc"
     }
   ],
-  "applications": null,
   "markdown_link": "README.md",
-  "entrypoint": "bin/testing-windows-ipc",
-  "first_run": "",
+  "entrypoint": "bin/testing-windows-ipc.exe",
   "build": {
-    "build": "make module.tar.gz",
     "setup": "make setup",
+    "build": "make module.tar.gz",
     "path": "module.tar.gz",
     "arch": [
       "windows/amd64"
